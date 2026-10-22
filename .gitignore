@@ -1,0 +1,17 @@
+# Ambientes virtuais e credenciais
+venv/
+.env
+metapira.log
+
+# Caches Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Dados de execução e mutações
+data/historico.jsonl
+config/genes/staging_*.md
+config/genes/backup_*.md
+
+# Sistema
+.DS_Store
