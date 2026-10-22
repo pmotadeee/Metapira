@@ -1,5 +1,5 @@
-import logging
 import asyncio
+import logging
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -9,45 +9,53 @@ from telegram.ext import (
     ContextTypes
 )
 
-try:
-    from .config import Config
-    from .security import SecuritySentinel
-    from .memory import BM25Memory
-    from .skills import SkillManager
-    from .llm import DeepSeekClient
-    from .pipeline import CognitivePipeline
-except (ImportError, ValueError):
-    # Quando concatenado em main.py pelo install.sh, as classes já estão no escopo global
-    pass
-
-class MetapiraTelegramBot:
-    def __init__(self, config):
+class Bot:
+    """
+    Classe Central Bot:
+    Orquestra a inicialização dos Dois Bots (Sentinela e Roteador),
+    a API DeepSeek, a Memória BM25 e a Matriz de Skills, gerenciando
+    as interações com instâncias da classe Usuario no Telegram.
+    """
+    def __init__(self, config: Config):
         self.config = config
-        self.sentinel = SecuritySentinel(config.arq_seguranca)
-        self.memory = BM25Memory(config.arq_historico)
-        self.skill_mgr = SkillManager(config.arq_tabela, config.arq_staging, config.arq_backup)
-        self.llm = DeepSeekClient(config.deepseek_key, config.deepseek_url)
-        self.pipeline = CognitivePipeline(
-            config=self.config,
-            sentinel=self.sentinel,
-            memory=self.memory,
-            skill_mgr=self.skill_mgr,
-            llm=self.llm
+        self.api = DeepSeekAPI(key=config.deepseek_key, url=config.deepseek_url)
+        self.memoria = MemoriaBM25(caminho_historico=config.arq_historico)
+        self.skills = TabelaSkills(
+            caminho_tabela=config.arq_tabela,
+            caminho_staging=config.arq_staging,
+            caminho_backup=config.arq_backup
+        )
+        # Inicialização dos Dois Bots
+        self.sentinela = SentinelaBot(caminho_prompt=config.arq_seguranca, api_deepseek=self.api)
+        self.roteador = RoteadorBot(
+            caminho_prompt=config.arq_roteador,
+            api_deepseek=self.api,
+            tabela_skills=self.skills,
+            memoria=self.memoria
         )
 
+    def processar_interacao(self, usuario: Usuario, mensagem: str) -> str:
+        # 1. Avaliação pelo Bot 1 (Sentinela)
+        seguro, motivo = self.sentinela.filtrar(mensagem)
+        if not seguro:
+            return motivo
+
+        # 2. Resposta formulada pelo Bot 2 (Roteador Cognitivo)
+        return self.roteador.processar(usuario, mensagem)
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        skills = self.skill_mgr.load_skills()
+        skills_ativas = self.skills.carregar()
         msg = (
-            "🤖 *Metapira Cognitive Engine Online*\n\n"
-            f"• Skills ativas: `{len(skills)}/10`\n"
+            "🤖 *Metapira Engine Online*\n\n"
+            f"• Skills ativas na matriz: `{len(skills_ativas)}/10`\n"
             "• Comandos:\n"
-            "  `/status` - Diagnóstico de memória e engine\n"
-            "  `/genes` - Tabela viva de 22 colunas de skills\n"
+            "  `/status` - Diagnóstico dos dois bots e memória BM25\n"
+            "  `/genes` - Tabela de skills de 22 colunas\n"
             "  `/help` - Resumo operacional\n\n"
-            "_Comandos de Administrador:_\n"
-            "  `/evolve` - Forçar ciclo evolutivo de habilidades\n"
+            "_Comandos Admin:_\n"
+            "  `/evolve` - Forçar ciclo evolutivo de skills\n"
             "  `/deploy` - Aplicar tabela em staging\n"
-            "  `/rollback` - Reverter para o último backup"
+            "  `/rollback` - Restaurar backup anterior"
         )
         await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -55,54 +63,53 @@ class MetapiraTelegramBot:
         await self.start(update, context)
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        skills = self.skill_mgr.load_skills()
-        total_interacoes = self.memory.count_interactions()
-        
-        status_msg = (
-            f"📊 *Diagnóstico do Metapira Engine*\n\n"
-            f"• Capacidade de Skills: `{len(skills)}/10` habilidades\n"
-            f"• Total de Interações (BM25): `{total_interacoes}`\n"
-            f"• Admin Autorizado ID: `{self.config.admin_id}`\n"
-            f"• DeepSeek Configurado: `{'Sim' if self.llm.is_configured() else 'Não'}`"
+        skills = self.skills.carregar()
+        interacoes = self.memoria.contar_registros()
+        msg = (
+            f"📊 *Diagnóstico do Metapira*\n\n"
+            f"• Dois Bots Operacionais: `Sentinela` e `Roteador`\n"
+            f"• Matriz de Skills: `{len(skills)}/10` habilidades\n"
+            f"• Interações BM25: `{interacoes}`\n"
+            f"• Admin ID: `{self.config.admin_id}`\n"
+            f"• API DeepSeek: `{'Configurada' if self.api.is_pronta() else 'Pendente'}`"
         )
-        await update.message.reply_text(status_msg, parse_mode="Markdown")
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
     async def cmd_genes(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        tabela = self.skill_mgr.get_table_markdown()
+        tabela = self.skills.obter_markdown()
         if len(tabela) > 4000:
             tabela = tabela[:3900] + "\n\n... (truncado para limite do Telegram)"
-        await update.message.reply_text(f"🧬 *Tabela Genética de Skills (22 Colunas):*\n\n{tabela}")
+        await update.message.reply_text(f"🧬 *Matriz Genética de Skills (22 Colunas):*\n\n{tabela}")
 
     async def cmd_evolve(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != self.config.admin_id:
-            await update.message.reply_text("⛔ Acesso não autorizado. Apenas o Admin pode invocar /evolve.")
+            await update.message.reply_text("⛔ Acesso não autorizado.")
             return
 
-        await update.message.reply_text("⏳ Disparando ciclo de auto-análise e evolução de skills...")
-        historico = self.memory.get_recent_history_text(3000)
+        await update.message.reply_text("⏳ Disparando ciclo de auto-análise e mutação de skills...")
         res = await asyncio.to_thread(
-            self.skill_mgr.evaluate_and_evolve,
+            self.skills.avaliar_e_evoluir,
             "Revisão forçada pelo administrador",
-            historico,
-            self.llm
+            "Atualização de matriz",
+            self.api
         )
         if res:
-            await update.message.reply_text(f"✅ Ciclo concluído: {res}")
+            await update.message.reply_text(f"✅ {res}")
         else:
-            await update.message.reply_text("ℹ️ Nenhuma mutação necessária. A tabela atual permanece ótima.")
+            await update.message.reply_text("ℹ️ Nenhuma alteração necessária na matriz.")
 
     async def cmd_deploy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != self.config.admin_id:
             await update.message.reply_text("⛔ Acesso não autorizado.")
             return
-        res = self.skill_mgr.deploy_staging()
+        res = self.skills.deploy()
         await update.message.reply_text(res)
 
     async def cmd_rollback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != self.config.admin_id:
             await update.message.reply_text("⛔ Acesso não autorizado.")
             return
-        res = self.skill_mgr.rollback()
+        res = self.skills.rollback()
         await update.message.reply_text(res)
 
     async def handle_msg(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,7 +119,7 @@ class MetapiraTelegramBot:
         texto = update.message.text.strip()
         chat_type = update.effective_chat.type
 
-        # Tratamento de grupos: responder apenas quando mencionado ou em resposta
+        # Tratamento de grupos: responder apenas quando mencionado ou respondido
         if chat_type != "private":
             bot_username = context.bot.username or ""
             mencionado = False
@@ -135,24 +142,27 @@ class MetapiraTelegramBot:
             if not mencionado:
                 return
 
+        # Instanciação da classe Usuario
+        u = update.effective_user
+        usuario = Usuario(id_usuario=u.id, username=u.username, nome=u.first_name)
+
         try:
             await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
         except Exception:
             pass
 
-        resposta = await asyncio.to_thread(self.pipeline.process_message, texto)
+        resposta = await asyncio.to_thread(self.processar_interacao, usuario, texto)
 
-        # Envio em blocos para respeitar o limite de 4096 caracteres
         for i in range(0, len(resposta), 4000):
             bloco = resposta[i : i + 4000]
             await update.message.reply_text(bloco)
 
     def run(self):
         if not self.config.telegram_token:
-            logging.error("ERRO: TELEGRAM_TOKEN não configurado. Verifique o .env!")
+            logging.error("ERRO CRÍTICO: TELEGRAM_TOKEN não configurado no .env!")
             return
 
-        logging.info("Iniciando Metapira Telegram Bot...")
+        logging.info("Iniciando Bot Metapira...")
         app = ApplicationBuilder().token(self.config.telegram_token).build()
 
         app.add_handler(CommandHandler("start", self.start))
@@ -164,14 +174,14 @@ class MetapiraTelegramBot:
         app.add_handler(CommandHandler("rollback", self.cmd_rollback))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_msg))
 
-        logging.info("Bot rodando com sucesso. Aguardando mensagens...")
+        logging.info("Bot rodando em produção. Aguardando mensagens...")
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 def main():
     logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    cfg = Config.load()
-    bot = MetapiraTelegramBot(cfg)
+    cfg = Config()
+    bot = Bot(cfg)
     bot.run()
 
 if __name__ == "__main__":
